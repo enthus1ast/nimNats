@@ -34,3 +34,8 @@ suite "header parsing":
     let t1 = "NATS/1.0\r\nfoo : baa\nfoo: zaa"
     # echo t1.parseHeaders()
     check t1.parseHeaders() == @[("foo", "zaa")]
+  test "header to string":
+    let t1 = "NATS/1.0\r\nfoo:baa\r\nfoo: zaa"
+    let h1 = t1.parseHeaders()
+    # echo t1.parseHeaders()
+    check "NATS/1.0\r\nfoo: baa\r\nfoo: zaa\r\n" == $h1
