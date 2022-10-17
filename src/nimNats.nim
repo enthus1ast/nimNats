@@ -347,35 +347,6 @@ proc publish*(nats: Nats, subject, payload: string, replyTo = "") {.async.} =
   await nats.send $msg
 
 when isMainModule and true:
-  import unittest
-  suite "nats":
-    test "header1":
-      let t1 = "NATS/1.0\r\nfoo: baa"
-      check t1.parseHeaders() == @[("foo", "baa")]
-    test "header2":
-      let t1 = "NATS/1.0\r\nfoo: baa\nfoo: baa"
-      check t1.parseHeaders() == @[("foo", "baa"), ("foo", "baa")]
-    test "header3":
-      let t1 = "NATS/1.0\r\nfoo: baa\nfoo: zaa"
-      check t1.parseHeaders() == @[("foo", "baa"), ("foo", "zaa")]
-    test "header4 (no space)":
-      let t1 = "NATS/1.0\r\nfoo:baa\nfoo:zaa"
-      check t1.parseHeaders() == @[("foo", "baa"), ("foo", "zaa")]
-    test "header invalid1 (wrong magic)":
-      let t1 = "NATS/1.1\r\nfoo: baa\nfoo: zaa"
-      check t1.parseHeaders().len == 0
-    test "header invalid2 (magic missing)":
-      let t1 = "foo: baa\nfoo: zaa"
-      check t1.parseHeaders().len == 0
-    test "header invalid3 (disallowed space)":
-      let t1 = "NATS/1.0\r\nfoo : baa\nfoo : zaa"
-      check t1.parseHeaders().len == 0
-    test "header invalid4 (disallowed space, ignore wrong header line)":
-      let t1 = "NATS/1.0\r\nfoo : baa\nfoo: zaa"
-      # echo t1.parseHeaders()
-      check t1.parseHeaders() == @[("foo", "zaa")]
-
-when isMainModule and false:
   proc handleDestinationSubject(nats: Nats, sid: Sid, subject, payload: string, replyTo: string = "") {.async.} =
     print "Callback!", sid, subject, payload, replyTo
 
