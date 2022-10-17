@@ -1,7 +1,8 @@
 import asyncnet, asyncdispatch, uri, strutils, json, strformat,
-  tables, print
+  tables, print, parseutils
 
 const crlf = "\c\l"
+const natsHeaderMagic = "NATS/1.0"
 
 type
   ConnectionStatus = enum
@@ -12,6 +13,7 @@ type
     # Sent by server
     INFO
     MSG
+    HMSG
 
     # Sent by client
     CONNECT
@@ -37,6 +39,7 @@ type
     `echo`: bool # : Optional boolean. If set to true, the server (version 1.2.0+) will not send originating messages from this connection to its own subscriptions. Clients should set this to true only for server supporting this feature, which is when proto in the INFO protocol is set to at least 1.
     sig: string # : In case the server has responded with a nonce on INFO, then a NATS client must use this field to reply with the signed nonce.
     jwt: string # : The JWT that identifies a user permissions and account.
+    headers: bool # : Enabling Receiving of Message Headers https://github.com/nats-io/nats-architecture-and-design/blob/main/adr/ADR-4.md
 
   MsgPub = object
     subject: string
@@ -60,7 +63,9 @@ type
     queueGroup: string # optional
     sid: Sid
     callback: SubscriptionCallback
-    reply: bool # if this is a reply subscription or not
+    # reply: bool # if this is a reply subscription or not
+
+  NatsHeaders = seq[tuple[key, val: string]]
 
   Nats = ref object
     sock: AsyncSocket
@@ -71,7 +76,7 @@ type
     # TODO add subscription to sid lookup table
     lastSidInt: int
     servers: seq[Uri]
-    reconnect: bool
+    reconnect: bool # auto reconnect enabled?
     connectionStatus: ConnectionStatus
     isHandelingMessages: bool
 
@@ -95,12 +100,46 @@ proc `$`(msg: MsgSub): string =
 proc `$`(msg: MsgUnsub): string =
   fmt"UNSUB {msg.sid} {msg.max_msgs}{crlf}"
 
-proc newNats(): Nats =
+const validHeaderKeyChars: set[char] = {33.char .. 126.char} - {':'}
+const validHeaderValueChars: set[char] = AllChars - {'\c', '\l'}
+
+proc parseHeaders*(str: string): NatsHeaders =
+  ## Parses nats header
+  #NATS/1.0\r\nfoo: baa
+  if str.len == 0: return
+  var lines = str.splitLines()
+  if lines.len == 0: return
+  if not lines[0].startsWith(natsHeaderMagic):
+    # if nats.debug:
+    # echo "[client]: invalid header magic: " & lines[0]
+    return
+  for line in lines[1 .. ^1]:
+    var pos = 0
+    var key = ""
+    var val = ""
+    pos += line.parseWhile(key, validHeaderKeyChars, pos)
+    let colonFound = line.skip(":", pos)
+    if colonFound == 0:
+      # echo "ERROR No colon found... ", line
+      # return @[]
+      continue
+    pos += colonFound
+    pos += line.skip(" ", pos) # optional whitespace
+    pos += line.parseWhile(val, validHeaderValueChars, pos) # TODO maybe just use the rest?
+    # let parts = line.split(": ", 1)
+    # if parts.len == 2:
+    #   result.add (parts[0], parts[1])
+    # else:
+    #   # if nats.debug:
+    #     # echo "[client]: invalid header line: " & line
+    #   continue
+    result.add (key, val)
+
+proc newNats*(reconnect = true, debug = false): Nats =
   result = Nats()
-  # result.connected = true
-  result.debug = true
+  result.debug = debug
   result.lastSidInt = 0
-  result.reconnect = true
+  result.reconnect = reconnect
   result.connectionStatus = disconnected
 
 proc splitMessage(str: string): tuple[verb: Verb, rest: string] =
@@ -204,7 +243,7 @@ proc handleMessages(nats: Nats) {.async.} =
 
       # parse the payload
       var payload = await nats.sock.recv(bytes)
-      print subject, sid, bytes, replyTo, payload
+      #print subject, sid, bytes, replyTo, payload
       # recv the crlf
       assert (await nats.sock.recv(crlf.len)) == crlf
 
@@ -214,9 +253,28 @@ proc handleMessages(nats: Nats) {.async.} =
       else:
         if nats.debug: echo "[err] no registered subscription!"
 
+    of HMSG:
+      # HMSG <subject> <sid> [reply-to] <#header bytes> <#total bytes>␍␊[payload]␍␊
+      discard
+      let parts = rest.split(" ")
+      let subject = parts[0]
+      let sid = parts[1]
+      let replyTo = if parts.len == 5:
+        parts[2]
+        else:
+        ""
+      let headerBytes = parts[^2].parseInt()
+      let totalBytes = parts[^1].parseInt()
+      let wholeBody = await nats.sock.recv(totalBytes + crlf.len)
+      let headerBody = wholeBody[0 .. headerBytes]
+      let payload = wholeBody[headerBytes .. ^1] # TODO remove crlf?
+      print subject, sid, replyTo, headerBytes,totalBytes, wholeBody, headerBody, payload
+
     else:
       if nats.debug:
         echo "[client] no handler for verb: ", verb
+
+
 
 
 proc connect(nats: Nats, urls: seq[Uri]) {.async.} =
@@ -242,6 +300,7 @@ proc connect(nats: Nats, urls: seq[Uri]) {.async.} =
   mc.pedantic = false
   mc.tls_required = false
   mc.name = ""
+  mc.headers = true
   # mc.lang = "nim" #TODO why error??
   # mc.version = "v0.1.0" #TODO why error??
   mc.protocol = 1
@@ -249,7 +308,7 @@ proc connect(nats: Nats, urls: seq[Uri]) {.async.} =
   if nats.isHandelingMessages == false:
     asyncCheck nats.handleMessages()
 
-proc pingInterval(nats: Nats, sleepTime: int = 1_000) {.async.} =
+proc pingInterval*(nats: Nats, sleepTime: int = 1_000) {.async.} =
   # while nats.connected:
   while nats.connectionStatus != disconnected:
     if nats.connectionStatus == connected:
@@ -257,27 +316,66 @@ proc pingInterval(nats: Nats, sleepTime: int = 1_000) {.async.} =
       await nats.send("PING" & crlf)
     await sleepAsync sleepTime
 
-proc subscribe*(nats: Nats, subject: string, cb: SubscriptionCallback): Future[Sid] {.async.} =
-  let msg = MsgSub(subject: subject, queueGroup: "", sid: nats.gensid())
-  var subscription = Subscription(subject: subject, queueGroup: "", sid: msg.sid, callback: cb)
+proc subscribe*(nats: Nats, subject: string, cb: SubscriptionCallback, queueGroup = ""): Future[Sid] {.async.} =
+
+  let msg = MsgSub(subject: subject, queueGroup: queueGroup, sid: nats.gensid())
+  var subscription = Subscription(subject: subject, queueGroup: queueGroup, sid: msg.sid, callback: cb)
   nats.subscriptions[msg.sid] = subscription
   await nats.send $msg
   return msg.sid
 
+proc reply*(nats: Nats, subject: string, cb: SubscriptionCallback, queueGroup = "NATS-RPLY-22"): Future[Sid] {.async.} =
+  ## same as subscribe but has a default queueGroup of "NATS-RPLY-22"
+  return await nats.subscribe(subject, cb, queueGroup)
+
 proc unsubscribe*(nats: Nats, sid: Sid, maxMsgs = 0) {.async.} =
+  ## Unsubscribes from the given Sid
   let msg = MsgUnsub(sid: sid, max_msgs: maxMsgs)
   await nats.send $msg
   if nats.subscriptions.hasKey(sid):
     nats.subscriptions.del(sid)
 
-# proc unsubscribe(nats: Nats, subject: Sid, maxMsgs = 0) {.async.} = # TODO
+proc unsubscribeSubject*(nats: Nats, subject: string, maxMsgs = 0) {.async.} =
+  ## Unsubscribes all that maches a given subject
+  for subscription in nats.subscriptions.values:
+    if subscription.subject == subject:
+      await nats.unsubscribe(subscription.sid)
 
-proc publish(nats: Nats, subject, payload: string, replyTo = "") {.async.} =
+proc publish*(nats: Nats, subject, payload: string, replyTo = "") {.async.} =
+  ## publishes a messages to the given subject, optionally a replyTo address can be specified
   let msg = MsgPub(subject: subject, payload: payload, replyTo: replyTo)
   await nats.send $msg
 
-when isMainModule:
+when isMainModule and true:
+  import unittest
+  suite "nats":
+    test "header1":
+      let t1 = "NATS/1.0\r\nfoo: baa"
+      check t1.parseHeaders() == @[("foo", "baa")]
+    test "header2":
+      let t1 = "NATS/1.0\r\nfoo: baa\nfoo: baa"
+      check t1.parseHeaders() == @[("foo", "baa"), ("foo", "baa")]
+    test "header3":
+      let t1 = "NATS/1.0\r\nfoo: baa\nfoo: zaa"
+      check t1.parseHeaders() == @[("foo", "baa"), ("foo", "zaa")]
+    test "header4 (no space)":
+      let t1 = "NATS/1.0\r\nfoo:baa\nfoo:zaa"
+      check t1.parseHeaders() == @[("foo", "baa"), ("foo", "zaa")]
+    test "header invalid1 (wrong magic)":
+      let t1 = "NATS/1.1\r\nfoo: baa\nfoo: zaa"
+      check t1.parseHeaders().len == 0
+    test "header invalid2 (magic missing)":
+      let t1 = "foo: baa\nfoo: zaa"
+      check t1.parseHeaders().len == 0
+    test "header invalid3 (disallowed space)":
+      let t1 = "NATS/1.0\r\nfoo : baa\nfoo : zaa"
+      check t1.parseHeaders().len == 0
+    test "header invalid4 (disallowed space, ignore wrong header line)":
+      let t1 = "NATS/1.0\r\nfoo : baa\nfoo: zaa"
+      # echo t1.parseHeaders()
+      check t1.parseHeaders() == @[("foo", "zaa")]
 
+when isMainModule and false:
   proc handleDestinationSubject(nats: Nats, sid: Sid, subject, payload: string, replyTo: string = "") {.async.} =
     print "Callback!", sid, subject, payload, replyTo
 
@@ -297,7 +395,7 @@ when isMainModule:
 
     let sid1 = await nats.subscribe("destination.subject", handleDestinationSubject)
     let sid2 = await nats.subscribe("destination.subject", handleDestinationSubject2)
-    let sid3 = await nats.subscribe("help", handleNeedHelp)
+    let sid3 = await nats.reply("help", handleNeedHelp)
     var pub = MsgPub()
     pub.subject = "destination.subject"
     # pub.replyTo = "replyAddress"
@@ -306,7 +404,7 @@ when isMainModule:
     while nats.connectionStatus != disconnected:
       for idx in 1..10:
         pub.payload = "SOME PAYLOAD" & crlf & "HAHAHA " & $idx
-        await nats.sock.send($pub)
+        await nats.send($pub)
         await sleepAsync(1_000)
 
       # await nats.unsubscribe(sid1)
@@ -314,5 +412,5 @@ when isMainModule:
       await sleepAsync(60_000)
     echo "end."
 
-  var nats = newNats()
+  var nats = newNats(debug = true)
   waitFor nats.main()
