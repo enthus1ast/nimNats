@@ -1,7 +1,7 @@
 nimNats
 =======
 
-A basic [NATS.io](https://nats.io/) client in pure Nim.
+A [NATS.io](https://nats.io/) client in pure Nim.
 
 Quality: wip
 
@@ -22,7 +22,7 @@ NatsCore
 - [ ] Cluster
   - [x] Learning of cluster servers
   - [X] Try to reconnect to every cluster server
-- [/] Reconnect
+- [ ] Reconnect (still Buggy)
 - [ ] SSL
 - [ ] Password authentication
 - [ ] JWT
@@ -46,10 +46,11 @@ To Implement:
 
 - 3.0.0 JetStream
 - 2.0.0 SSL
-- 1.0.0 Awaitable request/reply
 - ??? subject to distinct string
-- 0.1.1 Fix payload bugs
+- 0.2.1 Fix HMSG parser / crash
 
 Implemented:
 
+- 0.2.0 Awaitable request/reply
+- 0.1.1 Fix payload bugs
 - 0.1.0 basic core NATS features using callbacks.
