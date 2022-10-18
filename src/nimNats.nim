@@ -10,6 +10,7 @@ const inboxPrefix = "_nimNatsIn"
 type
 
   ConnectionError* = object of IOError
+  TimeoutError* = object of IOError
   ParsingError* = object of ValueError
 
   ConnectionStatus = enum
@@ -391,8 +392,7 @@ proc pingInterval*(nats: Nats, sleepTime: int = 1_000) {.async.} =
       await nats.send("PING" & crlf)
     await sleepAsync sleepTime
 
-proc subscribe*(nats: Nats, subject: string, cb: SubscriptionCallback, queueGroup = "", unsubscribeAfter = 0): Future[Sid] {.async.} =
-  echo "#TODO implement unsubscribeAfter"
+proc subscribe*(nats: Nats, subject: string, cb: SubscriptionCallback, queueGroup = ""): Future[Sid] {.async.} =
   let msg = MsgSub(subject: subject, queueGroup: queueGroup, sid: nats.genSid())
   var subscription = Subscription(subject: subject, queueGroup: queueGroup, sid: msg.sid, callback: cb)
   nats.subscriptions[msg.sid] = subscription
@@ -427,18 +427,24 @@ proc publish*(nats: Nats, subject, payload: string, headers: NatsHeaders, replyT
   let msg = MsgHpub(subject: subject, payload: payload, headers: headers, replyTo: replyTo)
   await nats.send $msg
 
-proc request*(nats: Nats, subject: string, payload: string, queueGroup = "NATS-RPLY-22", timeout = 3_000): Future[MsgHmsg] {.async.} =
+proc request*(nats: Nats, subject: string, payload: string, queueGroup = "NATS-RPLY-22", timeout = 5_000): Future[MsgHmsg] {.async.} =
   ## awaitable
   # TODO either unsubscribe after or timeout or both
   let inbox = nats.genInbox()
-  var fut = newFuture[MsgHmsg]()
+  var fut = newFuture[MsgHmsg](fromProc = "request")
   var sid: Sid
   proc cb(nats: Nats, msg: MsgHmsg) {.async.} =
-    await nats.unsubscribe(sid)
     fut.complete(msg)
-  sid = await nats.subscribe(inbox, cb, queueGroup, unsubscribeAfter = 1)
+  sid = await nats.subscribe(inbox, cb, queueGroup)
   await nats.publish(subject, payload, replyTo = inbox)
-  return await fut
+  var inTime = await withTimeout(fut, timeout)
+  if (inTime):
+    return await fut
+  else:
+    fut.fail(newException(TimeoutError, "[request]: timeout"))
+  result = await fut
+  await nats.unsubscribe(sid)
+
 
 when isMainModule and true:
 
@@ -476,7 +482,10 @@ when isMainModule and true:
         await nats.publish("destination.subject", "", @[("no", "content"), ("foo", "baa")])
 
         echo "SENDING REQUEST:"
-        echo "HELP MESSAGE:",  await nats.request("AAA", "")
+        try:
+          echo "HELP MESSAGE:",  await nats.request("AAA", "")
+        except TimeoutError:
+          echo "Noone wants to help me :( ", getCurrentExceptionMsg()
         await sleepAsync(1_000)
 
       # await nats.unsubscribe(sid1)
