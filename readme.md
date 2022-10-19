@@ -44,8 +44,8 @@ Changelog
 
 To Implement:
 
-- 3.0.0 JetStream
-- 2.0.0 SSL
+- 0.4.0 JetStream
+- 0.3.0 SSL
 - ??? subject to distinct string
 - 0.2.1 Fix HMSG parser / crash
 

@@ -1,5 +1,5 @@
 import asyncnet, asyncdispatch, uri, strutils, json, strformat,
-  tables, print, parseutils, random
+  tables, print, parseutils, random, sets, sequtils
 
 export uri
 
@@ -8,9 +8,9 @@ const natsHeaderMagic = "NATS/1.0"
 const validHeaderKeyChars: set[char] = {33.char .. 126.char} - {':'}
 const validHeaderValueChars: set[char] = AllChars - {'\c', '\l'}
 const inboxPrefix = "_nimNatsIn"
+const inboxRandomLen = ($int.high).len
 
 type
-
   ConnectionError* = object of IOError
   TimeoutError* = object of IOError
   ParsingError* = object of ValueError
@@ -20,6 +20,7 @@ type
     connected
     reconnecting
     disconnected
+
   Verb* = enum
     # Sent by server
     INFO
@@ -99,6 +100,10 @@ type
   # User defined callbacks.
   HandlerError = proc(nats: Nats, msg: string) {.async.}
   HandlerInfo = proc(nats: Nats, info: JsonNode) {.async.}
+  HandlerDisconnected = proc(nats: Nats) {.async.}
+  # HandlerReconnected = proc(nats: Nats) {.async.}
+  HandlerServersGained = proc(nats: Nats, servers: seq[Uri]) {.async.} # called when a new (cluster) server was discovered
+  HandlerServersLost = proc(nats: Nats, servers: seq[Uri]) {.async.} # called when a (cluster) server is gone.
 
   Nats* = ref object
     sock: AsyncSocket
@@ -112,14 +117,26 @@ type
     servers: seq[Uri]
     reconnect: bool # auto reconnect enabled?
     connectionStatus: ConnectionStatus
-    isHandelingMessages: bool
+    isHandelingMessages*: bool
     currentServer: Uri # the server we're currently connected to
     # User defined handler/callbacks
     handlerError*: HandlerError
     handlerInfo*: HandlerInfo # called when the server sends an info eg when a new cluster server is available.
+    handlerDisconnected*: HandlerDisconnected
+    # handlerReconnected*: HandlerReconnected
+    handlerServersGained*: HandlerServersGained
+    handlerServersLost*: HandlerServersLost
+
+  JetStream* = ref object # the jetstream context
+
 
 # Forward declarations
 proc connect*(nats: Nats, urls: seq[Uri]): Future[void]
+
+proc getConnectUrls(js: JsonNode): seq[Uri] =
+  if not js.isNil and js.hasKey("connect_urls"):
+    for elem in js["connect_urls"]:
+      result.add parseUri(elem.getStr())
 
 proc getCurrentServer*(nats: Nats): Uri =
   ## returns the server we're currently connected to.
@@ -138,6 +155,22 @@ proc defaultHandlerInfo*(nats: Nats, info: JsonNode) {.async.} =
   when not defined(release):
     echo info.pretty()
 
+proc defaultHandlerDisconnected*(nats: Nats) {.async.} =
+  when not defined(release):
+    echo "[defaultHandlerDisconnected] Disconnected"
+
+proc defaultHandlerServersGained*(nats: Nats, servers: seq[Uri]) {.async.} =
+  when not defined(release):
+    echo "Servers Discovered"
+    for server in servers:
+      echo server
+
+proc defaultHandlerServersLost*(nats: Nats, servers: seq[Uri]) {.async.} =
+  when not defined(release):
+    echo "Servers Lost"
+    for server in servers:
+      echo server
+
 
 proc genSid(nats: Nats): Sid =
   nats.lastSidInt.inc
@@ -146,13 +179,19 @@ proc genSid(nats: Nats): Sid =
 proc genInbox*(nats: Nats): Inbox =
   ## generates a new unique inbox
   # TODO store inboxes, to avoid collisions?
-  return inboxPrefix & $rand(int.high)
+  return inboxPrefix & align($rand(int.high), inboxRandomLen, '0')
 
 proc `$`*(headers: NatsHeaders): string =
   result = ""
   result &= natsHeaderMagic & crlf
   for (key, val) in headers:
     result &= fmt"{key}: {val}{crlf}"
+
+# proc `%*`*(headers: NatsHeaders): JsonNode =
+#   var elems: seq[seq[string]] = @[]
+#   for (key, val) in headers:
+#     elems.add @[key, val]
+#   return %* elems
 
 proc `[]`*(headers: NatsHeaders, key: string): seq[string] =
   # return all values with the key `key`
@@ -166,7 +205,7 @@ proc `$`*(msg: MsgPub): string =
 proc `$`*(msg: MsgHpub): string =
   # HPUB <subject> [reply-to] <#header bytes> <#total bytes>␍␊[headers]␍␊␍␊[payload]␍␊
   let headerstr = $msg.headers
-  fmt"{HPUB} {msg.subject} {msg.replyTo} {headerstr.len + crlf.len} {(headerstr.len + crlf.len) + msg.payload.len + (crlf.len)}{crlf}{headerstr}{crlf}{msg.payload}{crlf}{crlf}"
+  fmt"{HPUB} {msg.subject} {msg.replyTo} {headerstr.len + crlf.len} {(headerstr.len + crlf.len) + msg.payload.len}{crlf}{headerstr}{crlf}{msg.payload}{crlf}"
 
 proc `$`*(msg: MsgConnect): string =
   fmt"{CONNECT} {$ %* msg}{crlf}"
@@ -176,8 +215,6 @@ proc `$`*(msg: MsgSub): string =
 
 proc `$`*(msg: MsgUnsub): string =
   fmt"{UNSUB} {msg.sid} {msg.max_msgs}{crlf}"
-
-
 
 proc parseHeaders*(str: string): NatsHeaders =
   ## Parses nats header
@@ -212,6 +249,9 @@ proc newNats*(reconnect = true, debug = false): Nats =
   result.connectionStatus = disconnected
   result.handlerError = defaultHandlerError
   result.handlerInfo = defaultHandlerInfo
+  result.handlerDisconnected = defaultHandlerDisconnected
+  result.handlerServersGained = defaultHandlerServersGained
+  result.handlerServersLost = defaultHandlerServersLost
 
 proc splitMessage(str: string): tuple[verb: Verb, rest: string] =
   let parts = str.split(" ", 1)
@@ -246,15 +286,33 @@ proc handleMsgPING(nats: Nats, rest: string) {.async.} =
 proc handleMsgPONG(nats: Nats, rest: string) {.async.} =
   discard #TODO reset the timeout counter
 
+proc computeServersGainedAndLost(nats: Nats, info: JsonNode): tuple[gained, lost: seq[Uri]] =
+  let newServerSet = info.getConnectUrls().toHashSet()
+  let oldServerSet = nats.info.getConnectUrls().toHashSet()
+  if newServerSet == oldServerSet:
+    # everything is identically, nothing to do.
+    discard
+  else:
+    let serversGained = newServerSet - oldServerSet
+    let serversLost = oldServerSet - newServerSet
+    return (serversGained.toSeq(), serversLost.toSeq())
+
+
 proc handleMsgINFO(nats: Nats, rest: string) {.async.} =
   # Get informations from the server, this way we also learn about
   # new cluster servers.
-
   var info: JsonNode = %* {} # provide an empty default
   try:
     info = parseJson(rest)
   except:
     raise newException(ParsingError, "could not parse the server info: " & rest)
+
+  # Inform the user about servers gained and lost
+  let (serversGained, serversLost) = nats.computeServersGainedAndLost(info)
+  if not nats.handlerServersGained.isNil and serversGained.len > 0:
+    await nats.handlerServersGained(nats, serversGained)
+  if not nats.handlerServersLost.isNil and serversLost.len > 0:
+    await nats.handlerServersLost(nats, serversLost)
 
   # Call the user defined handler
   if not nats.handlerInfo.isNil:
@@ -266,9 +324,12 @@ proc handleMsgINFO(nats: Nats, rest: string) {.async.} =
   echo nats.info
 
   # Learn of new cluster nodes.
-  if nats.info.hasKey("connect_urls"):
-    for elem in nats.info["connect_urls"]:
-      echo elem
+  # if nats.info.hasKey("connect_urls"):
+  #   for elem in nats.info["connect_urls"]:
+  #     echo elem
+  for server in nats.info.getConnectUrls():
+    echo "Cluster Server: " & $server
+
 
 proc handleMsgMSG(nats: Nats, rest: string) {.async.} =
   # MSG is more complex since we must parse it but then also read
@@ -296,7 +357,6 @@ proc handleMsgMSG(nats: Nats, rest: string) {.async.} =
   #print subject, sid, bytes, replyTo, payload
   # recv the crlf
   let cc = (await nats.sock.recv(crlf.len))
-  echo "CC:", cc
   assert cc == crlf
 
   # call the callback
@@ -332,18 +392,20 @@ proc handleMsgHMSG(nats: Nats, rest: string) {.async.} =
 
 
 proc handleMessages*(nats: Nats) {.async.} =
-  ## This ist the main
+  ## This ist the main message handler.
   nats.isHandelingMessages = true
   if nats.debug: echo "[client] start handleMessages"
   # while nats.connected:
   while nats.connectionStatus != disconnected:
     # Wait for message
     let line = await nats.sock.recvLine()
+
     if nats.debug:
       echo "[recv]: ", line
     if line.len == 0:
       if nats.debug: echo "[server] disconnect"
-
+      if not nats.handlerDisconnected.isNil:
+        await nats.handlerDisconnected(nats) # Call disconnection handler
       if nats.reconnect:
         nats.connectionStatus = reconnecting
         # Automatic reconnect
@@ -354,7 +416,7 @@ proc handleMessages*(nats: Nats) {.async.} =
           for elem in nats.info["connect_urls"]:
             urls.add parseUri("nats://" & elem.getStr())
         await nats.connect(urls)
-        # Tell the new server what we have supscribed
+        # Tell the new server what we have subscribed
         for subscription in nats.subscriptions.values:
           echo "[client]: resubscribe"
           # resend
@@ -408,8 +470,8 @@ proc connect*(nats: Nats, urls: seq[Uri]) {.async.} =
   mc.version = "0.1.0"
   mc.protocol = 1
   await nats.send($mc)
-  if nats.isHandelingMessages == false:
-    asyncCheck nats.handleMessages()
+  # if nats.isHandelingMessages == false:
+  #   asyncCheck nats.handleMessages()
 
 proc pingInterval*(nats: Nats, sleepTime: int = 1_000) {.async.} =
   # while nats.connected:
@@ -491,6 +553,7 @@ when isMainModule and true:
       parseUri("nats://a:b@127.0.0.1:5222"),
       parseUri("nats://a:b@127.0.0.1:4222"),
       ])
+    asyncCheck nats.handleMessages()
     asyncCheck nats.pingInterval(10_000)
 
     let sid1 = await nats.subscribe("destination.subject", handleDestinationSubject)
@@ -504,18 +567,19 @@ when isMainModule and true:
     while nats.connectionStatus != disconnected:
       for idx in 1..10:
         pub.payload = "SOME PAYLOAD" & crlf & "HAHAHA " & $idx
-        await nats.publish("destination.subject", "FOO 1", @[("aaa", "bbb"), ("foo", "baa")])
-        # await nats.publish("destination.subject", "", @[("no", "content"), ("foo", "baa")])
+        await nats.publish("destination.subject", "FOO 1" & "END" , @[("aaa", "bbb"), ("foo", "baa")])
+        await nats.publish("destination.subject", "", @[("no", "content"), ("foo", "baa")])
+        await nats.publish("destination.subject", "", @[])
         try:
           echo "===================================="
-          echo "HELP MESSAGE:",  await nats.request("AAA", "A".repeat(rand(1024)))
+          echo "HELP MESSAGE:",  await nats.request("AAA", "A".repeat(rand(1024)) & "END")
           echo "===================================="
 
         except TimeoutError:
           echo "Noone wants to help me :( ", getCurrentExceptionMsg()
         # await sleepAsync(1_000)
-        # await sleepAsync(200)
-        await sleepAsync(50)
+        await sleepAsync(200)
+        # await sleepAsync(50)
 
       # await nats.unsubscribe(sid1)
       await nats.unsubscribe(sid2)
