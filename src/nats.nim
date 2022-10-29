@@ -9,12 +9,15 @@ const validHeaderKeyChars: set[char] = {33.char .. 126.char} - {':'}
 const validHeaderValueChars: set[char] = AllChars - {'\c', '\l'}
 const inboxPrefix = "_nimNatsIn"
 const inboxRandomLen = ($int.high).len
+const defaultQueueGroup* = "NATS-RPLY-22" ## queue group that is used by the official nats tooling
 
 type
   ConnectionError* = object of IOError
   TimeoutError* = object of IOError
   ParsingError* = object of ValueError
   NotImplementedError = object of CatchableError
+  BucketDoesNotExistError* = object of CatchableError
+  BucketKeyDoesNotExistError* = object of CatchableError
 
   ConnectionStatus* = enum
     connected
@@ -109,7 +112,7 @@ type
     sock: AsyncSocket
     # connected: bool
     debug*: bool
-    info: JsonNode
+    info*: JsonNode
     subscriptions: Table[Sid, Subscription]
     requests: Table[Inbox, Future[MsgHmsg]]
     # TODO add subscription to sid lookup table
@@ -132,6 +135,11 @@ type
 
 # Forward declarations
 proc connect*(nats: Nats, urls: seq[Uri]): Future[void]
+
+proc jetstreamAvailable*(nats: Nats): bool =
+  ## returns true if the server supports jetstream
+  if not nats.info.hasKey("jetstream"): return false
+  return nats.info["jetstream"].getBool()
 
 proc getConnectUrls(js: JsonNode): seq[Uri] =
   if not js.isNil and js.hasKey("connect_urls"):
@@ -170,7 +178,6 @@ proc defaultHandlerServersLost*(nats: Nats, servers: seq[Uri]) {.async.} =
     echo "Servers Lost"
     for server in servers:
       echo server
-
 
 proc genSid(nats: Nats): Sid =
   nats.lastSidInt.inc
@@ -241,8 +248,10 @@ proc parseHeaders*(str: string): NatsHeaders =
     result.add (key, val)
 
 proc newNats*(reconnect = true, debug = false): Nats =
+  ## Creates a new `Nats` object
   randomize()
   result = Nats()
+  result.info = %* {} # to avoid SIGSEGV: Illegal storage access
   result.debug = debug
   result.lastSidInt = 0
   result.reconnect = reconnect
@@ -267,7 +276,7 @@ proc splitMessage(str: string): tuple[verb: Verb, rest: string] =
     result.rest = ""
 
 proc send*(nats: Nats, str: string) {.async.} =
-  ## low level sending proc. use the `$` proc from the `Msg*`.
+  ## low level sending proc. Use the `$` proc's from the different `Msg*`.
   if nats.debug:
     echo "[send]: ", str.strip() # not accurate but less clutter in the console
   await nats.sock.send(str)
@@ -393,13 +402,13 @@ proc handleMsgHMSG(nats: Nats, rest: string) {.async.} =
 
 proc handleMessages*(nats: Nats) {.async.} =
   ## This ist the main message handler.
+  ## Start this yourself
   nats.isHandelingMessages = true
   if nats.debug: echo "[client] start handleMessages"
   # while nats.connected:
   while nats.connectionStatus != disconnected:
     # Wait for message
     let line = await nats.sock.recvLine()
-
     if nats.debug:
       echo "[recv]: ", line
     if line.len == 0:
@@ -428,7 +437,6 @@ proc handleMessages*(nats: Nats) {.async.} =
           await nats.send($sub)
         continue
       else:
-        # nats.connected = false
         nats.connectionStatus = disconnected
         return
 
@@ -446,6 +454,8 @@ proc handleMessages*(nats: Nats) {.async.} =
         echo "[client] no handler for verb: ", verb
 
 proc connect*(nats: Nats, urls: seq[Uri]) {.async.} =
+  ## connect to the first responding server from `urls`.
+  ## After this is done, start `handleMessages`
   for url in urls:
     # assert url.scheme == "nats"
     try:
@@ -470,10 +480,11 @@ proc connect*(nats: Nats, urls: seq[Uri]) {.async.} =
   mc.version = "0.1.0"
   mc.protocol = 1
   await nats.send($mc)
-  # if nats.isHandelingMessages == false:
-  #   asyncCheck nats.handleMessages()
+  # TODO maybe wait for INFO?
 
 proc pingInterval*(nats: Nats, sleepTime: int = 1_000) {.async.} =
+  ## starts to ping the server in the given interval
+  ## this is optional since the server pings the client as well.
   # while nats.connected:
   while nats.connectionStatus != disconnected:
     if nats.connectionStatus == connected:
@@ -482,25 +493,26 @@ proc pingInterval*(nats: Nats, sleepTime: int = 1_000) {.async.} =
     await sleepAsync sleepTime
 
 proc subscribe*(nats: Nats, subject: string, cb: SubscriptionCallback, queueGroup = ""): Future[Sid] {.async.} =
+  ## subscribes to the given subject, returns a Sid that is used to unsubscribe later.
   let msg = MsgSub(subject: subject, queueGroup: queueGroup, sid: nats.genSid())
   var subscription = Subscription(subject: subject, queueGroup: queueGroup, sid: msg.sid, callback: cb)
   nats.subscriptions[msg.sid] = subscription
   await nats.send $msg
   return msg.sid
 
-proc reply*(nats: Nats, subject: string, cb: SubscriptionCallback, queueGroup = "NATS-RPLY-22"): Future[Sid] {.async.} =
+proc reply*(nats: Nats, subject: string, cb: SubscriptionCallback, queueGroup = defaultQueueGroup): Future[Sid] {.async.} =
   ## same as subscribe but has a default queueGroup of "NATS-RPLY-22"
   return await nats.subscribe(subject, cb, queueGroup)
 
 proc unsubscribe*(nats: Nats, sid: Sid, maxMsgs = 0) {.async.} =
-  ## Unsubscribes from the given Sid
+  ## Unsubscribes from the given Sid (returned by subscribe)
   let msg = MsgUnsub(sid: sid, max_msgs: maxMsgs)
   await nats.send $msg
   if nats.subscriptions.hasKey(sid):
     nats.subscriptions.del(sid)
 
 proc unsubscribeSubject*(nats: Nats, subject: string, maxMsgs = 0) {.async.} =
-  ## Unsubscribes all that maches a given subject
+  ## Unsubscribes all subscriptions that maches a given subject.
   for subscription in nats.subscriptions.values:
     if subscription.subject == subject:
       await nats.unsubscribe(subscription.sid)
@@ -516,7 +528,7 @@ proc publish*(nats: Nats, subject, payload: string, headers: NatsHeaders, replyT
   let msg = MsgHpub(subject: subject, payload: payload, headers: headers, replyTo: replyTo)
   await nats.send $msg
 
-proc request*(nats: Nats, subject: string, payload: string, queueGroup = "NATS-RPLY-22", timeout = 5_000): Future[MsgHmsg] {.async.} =
+proc request*(nats: Nats, subject: string, payload: string = "", queueGroup = defaultQueueGroup, timeout = 5_000): Future[MsgHmsg] {.async.} =
   ## awaitable
   # TODO either unsubscribe after or timeout or both
   let inbox = nats.genInbox()
@@ -534,6 +546,95 @@ proc request*(nats: Nats, subject: string, payload: string, queueGroup = "NATS-R
     result = await fut
   await nats.unsubscribe(sid)
 
+# Jetstream ############
+proc jsApiInfo*(nats: Nats): Future[JsonNode] {.async.} =
+  # TODO json -> types?
+  return parseJson((await nats.request("$JS.API.INFO")).payload)
+
+type
+  PlJsApiStreamCreateKv = object
+    name: string
+    subjects: seq[string]
+# {"name":"KV_3buk","subjects":["$KV.3buk.\u003e"],"retention":"limits","max_consumers":-1,"max_msgs":-1,"max_bytes":-1,"discard":"new","max_age":0,"max_msgs_per_subject":1,"max_msg_size":-1,"storage":"file","num_replicas":1,"duplicate_window":120000000000,"placement":{"cluster":""},"deny_delete":true,"allow_rollup_hdrs":true,"allow_direct":true,"mirror_direct":false}
+
+## A key value bucket has two modes of operandi.
+## 1)
+##   The first one is that every value is aquired from the NATS server on a `bucket.get("val")`
+## 2)
+##   The second one is, that the value(s) are aquired once on the creation and is cached in a nim table
+##   then we subscribe on the buckets
+##   Subjects and the server informs us about key/value changes.
+##   This way the access is much faster.
+type
+  JsKvBucket = object
+    name*: string
+    nats: Nats # TODO is this good design? It allows `await bucket.get("foo")` syntax
+    cache*: Table[string, string]
+    # Config etc # TODO
+
+proc addBucket*(nats: Nats, bucket: string): Future[JsKvBucket] {.async.} =
+  let subject = fmt"$JS.API.STREAM.CREATE.KV_{bucket}"
+  var pl: PlJsApiStreamCreateKv
+  pl.name = fmt"KV_{bucket}"
+  pl.subjects = @[fmt"$KV.{bucket}.>"]
+  let res = parseJson((await nats.request(subject, $ %* pl)).payload) # TODO what to do with resp?
+  echo "addBucket ", res
+  return JsKvBucket(name: bucket, nats: nats)
+
+proc put(bucket: JsKvBucket, key, value: string): Future[void] {.async.} =
+  # PUB $KV.3buk.foo _INBOX.SdKKL4Oxk9a4LqIje3Zx6e.L7dSHjnc 11
+  # http://HAHA
+  let subject = fmt"$KV.{bucket.name}.{key}"
+  let res = await bucket.nats.request(subject, payload = value)
+  return
+
+proc get(bucket: JsKvBucket, key: string, fetch = true): Future[string] {.async.} =
+  # if fetch:
+  #   let subject = fmt"$JS.API.DIRECT.GET.KV_{bucket.name}.$KV.{bucket.name}.{key}"
+  #   result = (await bucket.nats.request(subject)).payload
+  #   bucket.cache
+  # else:
+  #   if bucket.cache.hasKey(key):
+  #     return bucket.cache[key]
+  let subject = fmt"$JS.API.DIRECT.GET.KV_{bucket.name}.$KV.{bucket.name}.{key}"
+  result = (await bucket.nats.request(subject)).payload
+
+proc splitKvSubject(str: string): tuple[prefix, bucket, key: string] =
+  ## splits a KV subject like: `$KV.tbuck.aa`
+  const kvPref = "$KV"
+  if str.len == 0: return
+  if not str.startsWith(kvPref): return
+  let parts = str[kvPref.len + 1 .. ^1].split(".", 1)
+  assert parts.len == 2
+  return (kvPref, parts[0], parts[1])
+
+
+proc hmsgToKv*(hmsg: MsgHmsg): tuple[key, value: string] =
+  ## extracts key & value from a MsgHmsg, use this in a KV bucket subscription.
+  let parts = splitKvSubject(hmsg.subject)
+  return (parts.key, hmsg.payload)
+
+proc subscribe(bucket: JsKvBucket, cb: SubscriptionCallback): Future[Sid] {.async.} =
+  ## Subscribes to the bucket topics, to get informed of all key/value updates
+  result = await bucket.nats.subscribe(fmt"$KV.{bucket.name}.>", cb)
+
+
+# proc unsubscribe(bucket: JsKvBucket)
+
+# PUB $JS.API.DIRECT.GET.KV_3buk.$KV.3buk.foo _INBOX.V72XnFzD0ZOPxyu5Bx9Szx.aQJR292F 0
+
+# HMSG _INBOX.V72XnFzD0ZOPxyu5Bx9Szx.aQJR292F 1  127 130
+# NATS/1.0
+# Nats-Stream: KV_3buk
+# Nats-Subject: $KV.3buk.foo
+# Nats-Sequence: 1
+# Nats-Time-Stamp: 2022-10-20T18:28:52.4890681Z
+
+# baa
+
+# proc getKv*(nats: Nats, bucket, key: string): Future[MsgHmsg] {.async.} =
+#   let subject = fmt"$JS.API.DIRECT.GET.KV_{bucket}.$KV.{bucket}.{key}"
+#   result = await nats.request(subject)
 
 when isMainModule and true:
 
@@ -549,12 +650,21 @@ when isMainModule and true:
 
   proc main(nats: Nats) {.async.} =
     await nats.connect(@[
-      parseUri("nats://127.0.0.1:2134"),
+      # parseUri("nats://127.0.0.1:2134"),
       parseUri("nats://a:b@127.0.0.1:5222"),
       parseUri("nats://a:b@127.0.0.1:4222"),
       ])
     asyncCheck nats.handleMessages()
     asyncCheck nats.pingInterval(10_000)
+
+    print nats.jetstreamAvailable # TODO this can only be known after the info message was handled.
+    if nats.jetstreamAvailable:
+      echo await nats.jsApiInfo()
+    var buckfoo = await nats.addBucket("3buk")
+    proc buckfooCb(nats: Nats, msg: MsgHmsg) {.async.} =
+      let kv = hmsgToKv(msg)
+      print "Bucket updated:#############################################", kv
+    let bucksid = await buckfoo.subscribe(buckfooCb)
 
     let sid1 = await nats.subscribe("destination.subject", handleDestinationSubject)
     let sid2 = await nats.subscribe("destination.subject", handleDestinationSubject2)
@@ -565,21 +675,33 @@ when isMainModule and true:
     echo $pub
     # while nats.connected:
     while nats.connectionStatus != disconnected:
-      for idx in 1..10:
-        pub.payload = "SOME PAYLOAD" & crlf & "HAHAHA " & $idx
-        await nats.publish("destination.subject", "FOO 1" & "END" , @[("aaa", "bbb"), ("foo", "baa")])
-        await nats.publish("destination.subject", "", @[("no", "content"), ("foo", "baa")])
-        await nats.publish("destination.subject", "", @[])
-        try:
-          echo "===================================="
-          echo "HELP MESSAGE:",  await nats.request("AAA", "A".repeat(rand(1024)) & "END")
-          echo "===================================="
+      await sleepAsync(500)
+      echo "###################"
+      # echo "KV:", (await nats.getKv("3buk", "foo")).payload
+      await buckfoo.put("foo", $rand(1024))
+      await buckfoo.put("baa", $rand(1024))
+      await buckfoo.put("baz", $rand(1024))
+      echo "KV:", await buckfoo.get("foo")
 
-        except TimeoutError:
-          echo "Noone wants to help me :( ", getCurrentExceptionMsg()
-        # await sleepAsync(1_000)
-        await sleepAsync(200)
-        # await sleepAsync(50)
+      echo "###################"
+      # quit()
+
+      when false:
+        for idx in 1..10:
+          pub.payload = "SOME PAYLOAD" & crlf & "HAHAHA " & $idx
+          await nats.publish("destination.subject", "FOO 1" & "END" , @[("aaa", "bbb"), ("foo", "baa")])
+          await nats.publish("destination.subject", "", @[("no", "content"), ("foo", "baa")])
+          await nats.publish("destination.subject", "", @[])
+          try:
+            echo "===================================="
+            echo "HELP MESSAGE:",  await nats.request("AAA", "A".repeat(rand(10)) & "END")
+            echo "===================================="
+
+          except TimeoutError:
+            echo "Noone wants to help me :( ", getCurrentExceptionMsg()
+          # await sleepAsync(1_000)
+          await sleepAsync(200)
+          # await sleepAsync(50)
 
       # await nats.unsubscribe(sid1)
       await nats.unsubscribe(sid2)

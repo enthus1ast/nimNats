@@ -33,24 +33,25 @@ JetStream
 - [ ] JetStream
 
 
-Authentication
-==============
-
-
-
 
 Changelog
 =========
 
 To Implement:
 
-- 0.4.0 JetStream
-- 0.3.0 SSL
+- ??? SSL
 - ??? subject to distinct string
-- 0.2.1 Fix HMSG parser / crash
+- ??? JetStream KV
+- ??? JetStream ObjectStore
+- ??? JetStream MsgQueue
+- ??? JetStream Beginning
+- ??? Core Nats example applications
+- ??? Document Core Nats api usage
 
 Implemented:
 
+- 0.2.2 Added user callbacks
+- 0.2.1 Fix HMSG parser / crash
 - 0.2.0 Awaitable request/reply
 - 0.1.1 Fix payload bugs
 - 0.1.0 basic core NATS features using callbacks.
