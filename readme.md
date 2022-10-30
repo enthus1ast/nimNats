@@ -17,20 +17,27 @@ NatsCore
 ---------
 
 - [x] PUB
-- [x] SUB
 - [x] HPUB
+- [x] SUB
+  - [x] Callback Style
+  - [ ] Async Style
+- [x] Request / Reply
+  - [x] Async Style
 - [ ] Cluster
   - [x] Learning of cluster servers
-  - [X] Try to reconnect to every cluster server
+  - [x] Try to reconnect to every cluster server
 - [ ] Reconnect (still Buggy)
-- [ ] SSL
-- [ ] Password authentication
+- [x] SSL
+  - [x] Self signed, not configurable
+  - [ ] Robust, configurable
+- [x] Password authentication
 - [ ] JWT
 
 JetStream
 ---------
 
 - [ ] JetStream
+- [x] Key Value (KV)
 
 
 
@@ -39,17 +46,18 @@ Changelog
 
 To Implement:
 
-- ??? SSL
 - ??? subject to distinct string
-- ??? JetStream KV
 - ??? JetStream ObjectStore
 - ??? JetStream MsgQueue
 - ??? JetStream Beginning
 - ??? Core Nats example applications
 - ??? Document Core Nats api usage
+- ??? Option To Enforce TLS
 
 Implemented:
 
+- 0.2.4 SSL
+- 0.2.3 JetStream KV
 - 0.2.2 Added user callbacks
 - 0.2.1 Fix HMSG parser / crash
 - 0.2.0 Awaitable request/reply

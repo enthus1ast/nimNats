@@ -1,6 +1,6 @@
 # Package
 
-version       = "0.2.2"
+version       = "0.2.4"
 author        = "David Krause"
 description   = "A pure Nim NATS.io client"
 license       = "MIT"
