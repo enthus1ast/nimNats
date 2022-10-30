@@ -1,0 +1,5 @@
+*.exe
+*.pem
+*.key
+OLD*
+*.py

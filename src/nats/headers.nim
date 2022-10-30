@@ -1,7 +1,8 @@
 import std/enumerate
 import strformat
 import strutils, parseutils
-import types
+# import types
+import constants
 type
   NatsHeaders* = seq[tuple[key, val: string]]
 
@@ -80,31 +81,3 @@ proc parseHeaders*(str: string): tuple[headers: NatsHeaders, errorNumber: int, e
     pos += line.skip(" ", pos) # optional whitespace
     pos += line.parseWhile(val, validHeaderValueChars, pos) # TODO maybe just use the rest?
     result.headers.add (key, val)
-
-when isMainModule:
-  import unittest
-
-  suite "headers":
-    test "1":
-      var hh: NatsHeaders
-      hh["foo"] = "baa"
-      check hh["foo"] == @["baa"]
-    test "2":
-      var hh: NatsHeaders
-      hh["foo"] = @["baa", "baz"]
-      check hh["foo"] == @["baa", "baz"]
-    test "parseHeaders; error messages":
-      let (headers, errorNumber, errorMessage) = parseHeaders("NATS/1.0 404 Message Not Found")
-      check headers.len == 0
-      check errorNumber == 404
-      check errorMessage == "Message Not Found"
-    test "parseHeaders; error messages; 2":
-      let (headers, errorNumber, errorMessage) = parseHeaders("NATS/1.0 404")
-      check headers.len == 0
-      check errorNumber == 404
-      check errorMessage == ""
-    test "parseHeaders; error messages; 3":
-      let (headers, errorNumber, errorMessage) = parseHeaders("NATS/1.0 404 ")
-      check headers.len == 0
-      check errorNumber == 404
-      check errorMessage == ""

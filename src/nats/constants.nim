@@ -1,4 +1,5 @@
-import strutils
+from strutils import AllChars
+
 const crlf* = "\c\l"
 const natsHeaderMagic* = "NATS/1.0"
 const validHeaderKeyChars*: set[char] = {33.char .. 126.char} - {':'}

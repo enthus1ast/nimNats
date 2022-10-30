@@ -6,6 +6,7 @@ description   = "A pure Nim NATS.io client"
 license       = "MIT"
 srcDir        = "src"
 
+bin = @["natscli"]
 
 # Dependencies
 

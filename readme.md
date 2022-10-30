@@ -4,6 +4,8 @@ nimNats
 A [NATS.io](https://nats.io/) client in pure Nim.
 
 Quality: wip
+  - Core somewhat stable
+  - KV somewhat stable
 
 installation
 ============
@@ -38,6 +40,8 @@ JetStream
 
 - [ ] JetStream
 - [x] Key Value (KV)
+  - [x] query the server on get
+  - [ ] subscribe to bucket updates and cache
 
 
 

@@ -1,4 +1,6 @@
-import nats, unittest, kv
+import nats, unittest
+include nats/kv
+
 
 suite "kv":
   test "kv subjects":
